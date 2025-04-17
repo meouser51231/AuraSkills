@@ -9,6 +9,11 @@ import dev.aurelium.auraskills.api.AuraSkillsBukkit;
 import dev.aurelium.auraskills.api.event.skill.SkillsLoadEvent;
 import dev.aurelium.auraskills.api.item.ItemManager;
 import dev.aurelium.auraskills.api.skill.Skill;
+import dev.aurelium.auraskills.bukkit.scheduler.FoliaScheduler;
+import dev.aurelium.auraskills.bukkit.scheduler.BukkitScheduler;
+import io.papermc.paper.threadedregions.scheduler.AsyncScheduler;
+import io.papermc.paper.threadedregions.scheduler.GlobalRegionScheduler;
+import io.papermc.paper.threadedregions.scheduler.RegionScheduler;
 import dev.aurelium.auraskills.api.skill.Skills;
 import dev.aurelium.auraskills.bukkit.ability.BukkitAbilityManager;
 import dev.aurelium.auraskills.bukkit.antiafk.AntiAfkManager;
@@ -114,7 +119,11 @@ import java.io.InputStream;
 import java.util.Locale;
 
 public class AuraSkills extends JavaPlugin implements AuraSkillsPlugin {
-
+    // Add Folia-related fields
+    private boolean isFolia;
+    private GlobalRegionScheduler globalRegionScheduler;
+    private RegionScheduler regionScheduler;
+    private AsyncScheduler asyncScheduler;
     private AuraSkillsApi api;
     private AuraSkillsBukkit apiBukkit;
     private ApiProvider apiProvider;
@@ -166,18 +175,24 @@ public class AuraSkills extends JavaPlugin implements AuraSkillsPlugin {
     @Override
     public void onEnable() {
         // Register the API
+    @Override
+    public void onEnable() {
+        // Check if running on Folia
+        isFolia = checkFolia();
+
+        // Register the API
         this.api = new ApiAuraSkills(this);
         this.apiProvider = new BukkitApiProvider(this);
         ApiRegistrationUtil.register(api);
-        this.itemManager = new ApiItemManager(this); // Needed in ApiAuraSkillsBukkit
+        this.itemManager = new ApiItemManager(this);
         this.apiBukkit = new ApiAuraSkillsBukkit(this);
         ApiBukkitRegistrationUtil.register(apiBukkit);
 
         logger = new BukkitLogger(this);
         platformUtil = new BukkitPlatformUtil();
-        // Load messages
         messageProvider = new BukkitMessageProvider(this);
         messageProvider.loadMessages();
+
         // Init managers
         skillManager = new SkillManager(this);
         abilityManager = new BukkitAbilityManager(this);
@@ -195,96 +210,140 @@ public class AuraSkills extends JavaPlugin implements AuraSkillsPlugin {
         sourceTypeRegistry.registerDefaults();
         itemRegistry = new BukkitItemRegistry(this);
         itemRegistry.getStorage().load();
-        // Create scheduler
-        scheduler = new BukkitScheduler(this);
+
+        // Initialize scheduler based on platform
+        if (isFolia) {
+            scheduler = new FoliaScheduler(this);
+            initializeFoliaSchedulers();
+        } else {
+            scheduler = new BukkitScheduler(this);
+        }
+
         audiences = BukkitAudiences.create(this);
         eventHandler = new BukkitEventHandler(this);
         hookManager = new HookManager();
         userManager = new BukkitUserManager(this);
         presetManager = new PresetManager(this);
-        generateConfigs(); // Generate default config files if missing
+
+        generateConfigs();
         generateDefaultMenuFiles();
+
         // Handle migration
         MigrationManager migrationManager = new MigrationManager(this);
         migrationManager.attemptConfigMigration();
-        // Load config.yml file
+
         configProvider = new BukkitConfigProvider(this);
-        configProvider.loadOptions(); // Also loads external plugin hooks
+        configProvider.loadOptions();
         initializeNbtApi();
-        initializeMenus(); // Generate menu files
-        // Initialize and migrate storage (connect to SQL database if enabled)
+        initializeMenus();
         initStorageProvider();
         migrationManager.attemptUserMigration();
-        // Load blocked/disabled worlds lists
+
         worldManager = new BukkitWorldManager(this);
-        worldManager.loadWorlds(); // Requires generateConfigs before
+        worldManager.loadWorlds();
         regionManager = new BukkitRegionManager(this);
         backupProvider = new BackupProvider(this);
         xpRequirements = new XpRequirements(this);
         leaderboardManager = new LeaderboardManager(this);
         uiProvider = new BukkitUiProvider(this);
         modifierManager = new BukkitModifierManager(this);
-        inventoryManager = new InventoryManager(this, dev.aurelium.slate.scheduler.Scheduler.createScheduler(this));
+
+        // Initialize inventory manager with appropriate scheduler
+        if (isFolia) {
+            inventoryManager = new InventoryManager(this,
+                dev.aurelium.slate.scheduler.Scheduler.createFoliaScheduler(this));
+        } else {
+            inventoryManager = new InventoryManager(this,
+                dev.aurelium.slate.scheduler.Scheduler.createScheduler(this));
+        }
         inventoryManager.init();
-        rewardManager = new BukkitRewardManager(this); // Loaded later
-        lootTableManager = new LootTableManager(this); // Loaded later
+
+        rewardManager = new BukkitRewardManager(this);
+        lootTableManager = new LootTableManager(this);
         confirmManager = new ConfirmManager(this);
+
         CommandRegistrar commandRegistrar = new CommandRegistrar(this);
         commandManager = commandRegistrar.registerCommands();
         messageProvider.setACFMessages(commandManager);
         levelManager = new BukkitLevelManager(this);
-        antiAfkManager = new AntiAfkManager(this); // Requires config loaded
+        antiAfkManager = new AntiAfkManager(this);
+
         registerPriorityEvents();
-        // Enabled bStats
+
         Metrics metrics = new Metrics(this, 21318);
 
-        // Stuff to be run on the first tick
-        scheduler.executeSync(() -> {
-            loadSkills(); // Load skills, stats, abilities, etc from configs
-            levelManager.registerLevelers(); // Requires skills loaded
-            levelManager.loadXpRequirements(); // Requires skills loaded
-            uiProvider.getBossBarManager().loadOptions(); // Requires skills registered
-            requirementManager = new RequirementManager(this); // Requires skills registered
-            rewardManager.loadRewards(); // Requires skills loaded
-            lootTableManager.loadLootTables(); // Requires skills registered
-            // Register default content
-            traitManager.registerTraitImplementations();
-            abilityManager.registerAbilityImplementations();
-            manaAbilityManager.registerProviders();
-            registerEvents();
-            registerAndLoadMenus();
-            // Call SkillsLoadEvent
-            SkillsLoadEvent event = new SkillsLoadEvent(skillManager.getSkillValues());
-            Bukkit.getPluginManager().callEvent(event);
-            // Start updating leaderboards
-            leaderboardManager.updateLeaderboards(); // Immediately update leaderboards
-            leaderboardManager.startLeaderboardUpdater(); // 5 minute interval
-            // bStats custom charts
-            new MetricsUtil(getInstance()).registerCustomCharts(metrics);
-
-            if (this.configBoolean(Option.CHECK_FOR_UPDATES)) {
-                UpdateChecker updateChecker = new UpdateChecker(this);
-                updateChecker.sendUpdateMessageAsync(Bukkit.getConsoleSender());
-            }
-        });
+        // Schedule first tick tasks using appropriate scheduler
+        if (isFolia) {
+            getGlobalRegionScheduler().execute(this, () -> runFirstTickTasks(metrics));
+        } else {
+            scheduler.executeSync(() -> runFirstTickTasks(metrics));
+        }
     }
 
-    @Override
-    public void onLoad() {
-        if (getServer().getPluginManager().getPlugin("WorldGuard") != null) {
-            if (WorldGuardPlugin.inst().getDescription().getVersion().startsWith("7.")) {
-                worldGuardFlags = new WorldGuardFlags(this);
-                worldGuardFlags.register();
-            }
+    // Folia-specific methods
+    private boolean checkFolia() {
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
+    }
+
+    private void initializeFoliaSchedulers() {
+        if (!isFolia) return;
+
+        this.globalRegionScheduler = Bukkit.getGlobalRegionScheduler();
+        this.regionScheduler = Bukkit.getRegionScheduler();
+        this.asyncScheduler = Bukkit.getAsyncScheduler();
+    }
+
+    private void runFirstTickTasks(Metrics metrics) {
+        loadSkills();
+        levelManager.registerLevelers();
+        levelManager.loadXpRequirements();
+        uiProvider.getBossBarManager().loadOptions();
+        requirementManager = new RequirementManager(this);
+        rewardManager.loadRewards();
+        lootTableManager.loadLootTables();
+
+        traitManager.registerTraitImplementations();
+        abilityManager.registerAbilityImplementations();
+        manaAbilityManager.registerProviders();
+        registerEvents();
+        registerAndLoadMenus();
+
+        SkillsLoadEvent event = new SkillsLoadEvent(skillManager.getSkillValues());
+        Bukkit.getPluginManager().callEvent(event);
+
+        leaderboardManager.updateLeaderboards();
+        leaderboardManager.startLeaderboardUpdater();
+
+        new MetricsUtil(getInstance()).registerCustomCharts(metrics);
+
+        if (this.configBoolean(Option.CHECK_FOR_UPDATES)) {
+            UpdateChecker updateChecker = new UpdateChecker(this);
+            updateChecker.sendUpdateMessageAsync(Bukkit.getConsoleSender());
         }
     }
 
     @Override
     public void onDisable() {
         scheduler.shutdown();
-        // Save users
+
+        // Use appropriate scheduler for shutdown tasks
+        if (isFolia) {
+            getGlobalRegionScheduler().execute(this, () -> {
+                performShutdownTasks();
+            });
+        } else {
+            performShutdownTasks();
+        }
+    }
+
+    private void performShutdownTasks() {
         for (User user : userManager.getUserMap().values()) {
-            user.cleanUp(); // Remove Fleeting
+            user.cleanUp();
             try {
                 storageProvider.save(user);
             } catch (Exception e) {
@@ -294,39 +353,36 @@ public class AuraSkills extends JavaPlugin implements AuraSkillsPlugin {
         userManager.getUserMap().clear();
         regionManager.saveAllRegions(false, true);
         regionManager.clearRegionMap();
+
         try {
             backupAutomatically();
         } catch (Exception e) {
             logger.warn("Error creating automatic backup");
             e.printStackTrace();
         }
-        // Shut down connection pool
+
         if (storageProvider instanceof SqlStorageProvider sqlStorageProvider) {
             sqlStorageProvider.getPool().disable();
         }
+
         itemRegistry.getStorage().save();
     }
 
-    private void backupAutomatically() throws Exception {
-        // Automatic backups
-        if (!configBoolean(Option.AUTOMATIC_BACKUPS_ENABLED)) {
-            return;
-        }
-        File metaFile = new File(this.getDataFolder(), "/backups/meta.yml");
-        ConfigurationNode metaConfig = FileUtil.loadYamlFile(metaFile);
+    // Folia getter methods
+    public boolean isFolia() {
+        return isFolia;
+    }
 
-        long lastBackup = metaConfig.node("last_automatic_backup").getLong(0);
-        // Save backup if past minimum interval
-        if (lastBackup + (long) (configDouble(Option.AUTOMATIC_BACKUPS_MINIMUM_INTERVAL_HOURS) * 3600000) <= System.currentTimeMillis()) {
-            if (backupProvider == null) {
-                return;
-            }
-            // Update meta file
-            metaConfig.node("last_automatic_backup").set(System.currentTimeMillis());
-            FileUtil.saveYamlFile(metaFile, metaConfig);
+    public GlobalRegionScheduler getGlobalRegionScheduler() {
+        return globalRegionScheduler;
+    }
 
-            backupProvider.saveBackup(false);
-        }
+    public RegionScheduler getRegionScheduler() {
+        return regionScheduler;
+    }
+
+    public AsyncScheduler getAsyncScheduler() {
+        return asyncScheduler;
     }
 
     public void generateConfigs() {
